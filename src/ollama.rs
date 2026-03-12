@@ -23,17 +23,27 @@ pub fn select_model() -> &'static str {
     }
 }
 
-fn ollama_dir() -> PathBuf {
+fn data_dir() -> PathBuf {
     let dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("virus")
-        .join("ollama");
+        .join("virus");
+    std::fs::create_dir_all(&dir).ok();
+    dir
+}
+
+fn ollama_dir() -> PathBuf {
+    let dir = data_dir().join("ollama");
     std::fs::create_dir_all(&dir).ok();
     dir
 }
 
 fn ollama_exe() -> PathBuf {
     ollama_dir().join("ollama.exe")
+}
+
+/// Try to find ollama on PATH first
+fn system_ollama() -> Option<PathBuf> {
+    which::which("ollama").ok()
 }
 
 /// Check if ollama is reachable
@@ -47,29 +57,57 @@ async fn is_ollama_running(client: &Client) -> bool {
 }
 
 /// Download ollama if not present
-async fn download_ollama(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
-    let exe = ollama_exe();
-    if exe.exists() {
-        return Ok(());
+async fn download_ollama(client: &Client) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // check system PATH first
+    if let Some(path) = system_ollama() {
+        eprintln!("[virus] found ollama on system: {:?}", path);
+        return Ok(path);
     }
 
-    eprintln!("[virus] downloading ollama...");
-    let zip_path = ollama_dir().join("ollama.zip");
+    let exe = ollama_exe();
+    if exe.exists() {
+        eprintln!("[virus] ollama already at {:?}", exe);
+        return Ok(exe);
+    }
 
-    let response = client.get(OLLAMA_ZIP_URL).send().await?;
+    eprintln!("[virus] downloading ollama from github...");
+    eprintln!("[virus] url: {}", OLLAMA_ZIP_URL);
+
+    let response = client
+        .get(OLLAMA_ZIP_URL)
+        .timeout(Duration::from_secs(600))
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("download failed: HTTP {}", response.status()).into());
+    }
+
     let bytes = response.bytes().await?;
+    eprintln!("[virus] downloaded {} bytes", bytes.len());
+
+    let zip_path = ollama_dir().join("ollama.zip");
     std::fs::write(&zip_path, &bytes)?;
 
-    // extract ollama.exe from the zip
+    // extract everything from the zip
     let file = std::fs::File::open(&zip_path)?;
     let mut archive = zip::ZipArchive::new(file)?;
+    eprintln!("[virus] extracting {} files from zip...", archive.len());
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        let name = entry.name().to_string();
+        let raw_name = entry.name().to_string();
 
-        // extract everything to the ollama dir, preserving structure
+        // flatten: strip any leading directory (e.g. "ollama-windows-amd64/")
+        let name = raw_name
+            .split('/')
+            .skip_while(|s| !s.contains('.') && !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        let name = if name.is_empty() { raw_name.clone() } else { name };
+
         let out_path = ollama_dir().join(&name);
+
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path).ok();
         } else {
@@ -82,20 +120,39 @@ async fn download_ollama(client: &Client) -> Result<(), Box<dyn std::error::Erro
     }
 
     std::fs::remove_file(&zip_path).ok();
-    eprintln!("[virus] ollama downloaded to {:?}", ollama_dir());
-    Ok(())
+
+    // find ollama.exe — might be at root or in a subdirectory
+    let exe = find_ollama_exe(&ollama_dir()).ok_or("ollama.exe not found in zip")?;
+    eprintln!("[virus] ollama extracted to {:?}", exe);
+    Ok(exe)
+}
+
+/// Recursively search for ollama.exe in a directory
+fn find_ollama_exe(dir: &std::path::Path) -> Option<PathBuf> {
+    let direct = dir.join("ollama.exe");
+    if direct.exists() {
+        return Some(direct);
+    }
+    // search subdirectories
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_ollama_exe(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().map(|f| f == "ollama.exe").unwrap_or(false) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// Start ollama serve as a background process
-fn start_ollama_process() {
-    let exe = ollama_exe();
-    if !exe.exists() {
-        eprintln!("[virus] ollama binary not found at {:?}", exe);
-        return;
-    }
-
-    eprintln!("[virus] starting ollama serve...");
-    Command::new(exe)
+fn start_ollama_process(exe_path: &std::path::Path) {
+    eprintln!("[virus] starting ollama serve from {:?}", exe_path);
+    Command::new(exe_path)
         .arg("serve")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -103,17 +160,17 @@ fn start_ollama_process() {
         .ok();
 }
 
-/// Ensure ollama is downloaded and running
+/// Ensure ollama is downloaded and running. Returns the path to ollama.exe.
 pub async fn ensure_ollama(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
-    download_ollama(client).await?;
+    let exe_path = download_ollama(client).await?;
 
     if !is_ollama_running(client).await {
-        start_ollama_process();
+        start_ollama_process(&exe_path);
         // wait for it to start
-        for _ in 0..30 {
+        for i in 0..30 {
             tokio::time::sleep(Duration::from_secs(2)).await;
             if is_ollama_running(client).await {
-                eprintln!("[virus] ollama is running");
+                eprintln!("[virus] ollama is running (took ~{}s)", (i + 1) * 2);
                 return Ok(());
             }
         }
@@ -126,12 +183,12 @@ pub async fn ensure_ollama(client: &Client) -> Result<(), Box<dyn std::error::Er
 
 /// Pull a model (no-op if already pulled)
 pub async fn pull_model(client: &Client, model: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("[virus] pulling model: {}", model);
+    eprintln!("[virus] pulling model: {} (this may take a while on first run)", model);
 
     let resp = client
         .post(format!("{}/api/pull", OLLAMA_API))
         .json(&serde_json::json!({ "name": model, "stream": false }))
-        .timeout(Duration::from_secs(3600)) // models can be large
+        .timeout(Duration::from_secs(7200)) // models can be very large
         .send()
         .await?;
 
